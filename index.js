@@ -3,62 +3,103 @@
 const {OAuth2Client} = require('google-auth-library')
 const Storage = require('@google-cloud/storage')
 const fs = require('mz/fs')
-const mktemp = require('mktemp')
-const {promisify} = require('util')
-const createTempFile = promisify(require('mktemp').createFile)
+const {withFile} = require('tmp-promise')
 const has = require('lodash.has')
 const isNull = require('lodash.isnull')
+const isUndefined = require('lodash.isundefined')
+const isArray = require('lodash.isarray')
 const {Buffer} = require('safe-buffer')
 const querystring = require('querystring')
 const url = require('url')
+const path = require('path')
+const os = require('os')
+const tmp = require('tmp-promise')
+
+const tempFileMask = 'XXXXXXXXXX.json'
+
+/** Used when running on simulator **/
+const yamlFile = path.join(__dirname, '.env.yaml')
+if (process.env.PUBSUB_EMULATOR_HOST && fs.existsSync(yamlFile)) {
+  const yaml = require('js-yaml')
+  try {
+    const config = yaml.safeLoad(fs.readFileSync(yamlFile, 'utf8'))
+    for (let varName in config) {
+      process.env[varName] = config[varName]
+    }
+  } catch (e) {
+    console.error(e)
+    process.exit(1)
+  }
+  process.env.HTTP_TRIGGER_ENDPOINT = 'http://localhost:8010/squashed-melon/asia-northeast1/oauth2-manager'
+}
 
 // Variables
-const redirectUrl = process.env.HTTP_TRIGGER_ENDPOINT + process.env.REDIRECT_PATH
-const scopes = process.env.OAUTH2_AUTH_SCOPES ? JSON.parse(process.env.OAUTH2_AUTH_SCOPES) : []
+const redirectCallbackPath = "/callback"
+const redirectAuthPath = "/auth"
+const scopes = process.env.OAUTH2_AUTH_SCOPES ? process.env.OAUTH2_AUTH_SCOPES.split(',') : []
 const accessType = process.env.OAUTH2_AUTH_ACCESS_TYPE
 const projectId = process.env.GCP_PROJECT
 const bucketName = process.env.OAUTH2_STORAGE_BUCKET
-const storageTokenFile = process.env.OAUTH2_STORAGE_TOKEN_FILE || 'token.json'
-const storageKeysFile = process.env.OAUTH2_STORAGE_KEY_FILE || 'key.json'
+const storageTokenFile = process.env.OAUTH2_STORAGE_TOKEN_FILE
+const credsOauthClient = process.env.CREDENTIALS_OAUTH_CLIENT ? path.join(__dirname, process.env.CREDENTIALS_OAUTH_CLIENT.split('/').join(path.sep)) : null
+const credsStorageService = process.env.CREDENTIALS_STORAGE_SERVICE ? path.join(__dirname, process.env.CREDENTIALS_STORAGE_SERVICE.split('/').join(path.sep)) : null
 const encryptionKey = process.env.OAUTH2_ENCRYPTION_KEY ? Buffer.from(process.env.OAUTH2_ENCRYPTION_KEY, 'base64') : null
+const redirectUrl = process.env.HTTP_TRIGGER_ENDPOINT + redirectCallbackPath
 
-const storage = new Storage({
-  projectId: projectId,
-})
-const bucket = storage.bucket(bucketName)
+if (isNull(scopes) ||
+    isNull(accessType) ||
+    isNull(bucketName) ||
+    isNull(storageTokenFile) ||
+    isNull(credsOauthClient) ||
+    isNull(credsStorageService)) {
+      throw new Error("Environment Variables not available!")
+    }
 
-// const handlePost = (request, response) => {
-//   const busboy = new Busboy({ headers: req.headers })
-//   busboy.on('file', function(fieldname, file, filename, encoding, mimetype) {
-//     console.log('File [' + fieldname + ']: filename: ' + filename + ', encoding: ' + encoding + ', mimetype: ' + mimetype)
-//     file.on('data', function(data) {
-//       console.log('File [' + fieldname + '] got ' + data.length + ' bytes')
-//     })
-//     file.on('end', function() {
-//       console.log('File [' + fieldname + '] Finished')
-//     })
-//   })
-//   busboy.on('field', function(fieldname, val, fieldnameTruncated, valTruncated, encoding, mimetype) {
-//     console.log('Field [' + fieldname + ']: value: ' + inspect(val))
-//   })
-//   busboy.on('finish', function() {
-//     console.log('Done parsing form!')
-//     res.writeHead(303, { Connection: 'close', Location: '/' })
-//     res.end()
-//   })
-//   req.pipe(busboy)
-// }
+let bucket
+let token
+let keys
+let storageCreds
+let oAuth2Client
 
-const getKeys = async () => {
-  const tempFile = await createTempFile('XXXXXXXXXX.json')
-  const file = bucket.file(storageKeysFile)
+const debugLog = (msg) => {
+  console.log(msg)
+}
+
+const createTempFile = async () => {
+  return await tmp.tmpName()
+}
+
+const getTokenFile = async (srcFile, encKey) => {
+  const tempFile = await createTempFile()
+  const file = bucket.file(storageTokenFile)
+  const checkFileExists = _=>{
+    return file.exists().then((data)=>{ return data[0] })
+  }
+  if (!await checkFileExists()) {
+    console.log('Token does not exist!')
+    return null
+  }
   let options = {
     destination: tempFile
   }
   if (encryptionKey) options.encryptionKey = encryptionKey
+  console.log('File Exists trying to download')
   await file.download(options)
-  console.log(`File ${keyFile} downloaded to ${tempFile}.`);
+  debugLog(`File ${storageTokenFile} downloaded to ${tempFile}.`);
   return tempFile
+}
+
+const getToken = async () => {
+  const tempTokenFile = await getTokenFile(storageTokenFile, encryptionKey)
+  console.log('tempTokenFile', tempTokenFile)
+  if (isNull(tempTokenFile)) {
+    debugLog("No Token file available from Cloud Storage")
+    return null
+  }
+  debugLog("Got Token File from Cloud Storage")
+  const tokenFileContents = await fs.readFile(tempTokenFile)
+  await fs.unlink(tempTokenFile)
+  return tokenFileContents
 }
 
 const storeToken = async (srcFilename) => {
@@ -67,58 +108,83 @@ const storeToken = async (srcFilename) => {
   }
   if (encryptionKey) options.encryptionKey = encryptionKey
   await bucket.upload(srcFilename, options)
-  console.log(`File ${srcFilename} uploaded to gs://${bucketName}/${storageTokenFile}.`)
+  debugLog(`File ${srcFilename} uploaded to gs://${bucketName}/${storageTokenFile}.`)
+}
+
+const getKeys = async () => {
+  const keysFileContents = await fs.readFile(credsOauthClient)
+  const keys = JSON.parse(keysFileContents)
+  if (!has(keys, 'installed') ||
+      !has(keys.installed, 'client_id') ||
+      !has(keys.installed, 'client_secret') ||
+      !has(keys.installed, 'redirect_uris') ||
+      !isArray(keys.installed.redirect_uris) ||
+      keys.installed.redirect_uris.length === 0) {
+        throw new Error('Invalid keys file!')
+      }
+  return keys
 }
 
 const handleGet = async (req, res) => {
-  const qs = querystring.parse(url.parse(req.url).query)
+  const urlPath = url.parse(req.url).path.split('?')[0]
+  const urlQS = querystring.parse(url.parse(req.url).query)
 
-  // Handle Error
-  if (has(qs, 'error') && !isNull(qs.error)) {
-    console.log('FAILED! Got Error',qs.error)
-    return handleError('Failed to get code :-( Please retry!', res)
+  if (urlPath === '/' || (urlPath !== redirectAuthPath && urlPath !== redirectCallbackPath)) {
+    console.log(urlPath)
+    return handleError('Invalid path passed', res)
+  } else {
+    bucket = bucket || new Storage({
+                            projectId: projectId,
+                            keyFilename: credsStorageService
+                        }).bucket(bucketName)
+    debugLog("Initialized bucket")
+    token = token || await getToken()
+    debugLog("Initialized token" + token)
+    keys = keys || await getKeys()
+    debugLog("Initialized keys" + keys)
+    oAuth2Client = oAuth2Client || new OAuth2Client(
+                                      keys.installed.client_id,
+                                      keys.installed.client_secret,
+                                      redirectUrl)
+    if (urlPath === redirectAuthPath) {
+      //oAuth2Client._redirectUri = redirectUrl
+      const authUrl = oAuth2Client.generateAuthUrl({
+        access_type: accessType,
+        scope: scopes
+      })
+      return res.redirect(authUrl)
+    } else if (urlPath === redirectCallbackPath) {
+      if (has(urlQS, 'error') && !isNull(urlQS.error)) {
+        debugLog('FAILED! Got Error', urlQS.error)
+        return handleError('Failed to get code :-( Please retry!', res)
+      }
+      if (!has(urlQS, 'code')) {
+        debugLog('Invalid return from callback! No code in query')
+        return handleError('Invalid callback', res)
+      }
+      // Handle return from Google Oauth2
+      const code = urlQS.code
+      debugLog(`Got Authorization Code: ${code}`)
+      try {
+        token = await oAuth2Client.getToken(code)
+        const tempFile = await createTempFile()
+        await fs.writeFile(tempFile, token)
+        await storeToken(tempFile)
+        await fs.unlink(tempFile)
+        debugLog('Successfully stored token to cloud storage', res)
+      } catch(err) {
+        console.error(err)
+        await fs.unlink(tempFile)
+        return handleError('Error trying to get or save token', res)
+      }
+      res.status(200).end('Successfully Got Code. You can close this page now :-)')
+    }
   }
-
-  const keys = await getKeys()
-  const oAuth2Client = new OAuth2Client(
-    keys.web.client_id,
-    keys.web.client_secret,
-    keys.web.redirect_uris[0]
-  );
-
-  // Handle Blank Request
-  if (!has(qs, 'code')) {
-    oAuth2Client._redirectUri = redirectUrl
-    const authUrl = oAuth2Client.generateAuthUrl({
-      access_type: accessType,
-      scope: scopes
-    })
-    return res.redirect(authUrl)
-  }
-
-  // Handle return from Google Oauth2
-  const code = req.query.code
-  console.log(`Got Authorization Code: ${code}`)
-  let token;
-  try {
-    token = await auth.getToken(code)
-    const tempFile = await createTempFile('XXXXXXXXXX.json')
-    await fs.writeFile(tempFile, JSON.stringify(token,null,2))
-    await storeToken(tempFile)
-    await fs.unlink(tempFile)
-    console.log('Successfully stored token to cloud storage', res)
-  } catch(err) {
-    console.error(err)
-    await fs.unlink(tempFile)
-    return handleError('Error trying to get or save token', res)
-  }
-  res.end('Successfully Got Code. You can close this page now :-)')
 }
 
 const handleError = (msg, res) => {
   console.error(msg)
-  res.writeHead(400, { Connection: 'close' })
-  res.end('An error occured')
+  res.status(400).end('An error occured')
 }
 
 /*

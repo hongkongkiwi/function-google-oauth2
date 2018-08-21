@@ -1,6 +1,24 @@
 'use strict'
 
-require('dotenv').config()
+const path = require('path')
+const yaml = require('js-yaml')
+const fs = require('fs')
+const isArray = require('lodash.isarray')
+
+let config
+try {
+  config = yaml.safeLoad(fs.readFileSync(path.join(__dirname, '.env.yaml'), 'utf8'))
+  for (let varName in config) {
+    if (isArray(config[varName])) {
+      process.env[varName] = config[varName].join(',')
+    } else {
+      process.env[varName] = config[varName]
+    }
+  }
+} catch (e) {
+  console.error(e)
+  process.exit(1)
+}
 
 const func = require('./index')
 
