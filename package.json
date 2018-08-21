@@ -4,19 +4,23 @@
   "description": "Cloud Function to get and save oauth2 tokens to cloud storage",
   "main": "index.js",
   "dependencies": {
-    "dotenv": "^6.0.0",
+    "@google-cloud/storage": "^1.7.0",
     "google-auth-library": "^1.6.1",
-    "lodash.has": "^4.5.2",
-    "lodash.isnull": "^3.0.0",
-    "mktemp": "^0.4.0",
+    "googleapis": "^32.0.0",
+    "js-yaml": "^3.12.0",
+    "jsonwebtoken": "^8.3.0",
+    "jwt-decode": "^2.2.0",
+    "lodash": "^4.17.10",
     "mz": "^2.7.0",
     "querystring": "^0.2.0",
     "safe-buffer": "^5.1.2",
+    "tmp-promise": "^1.0.5",
     "url": "^0.11.0"
   },
-  "devDependencies": {},
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "deploy": "./bin/deploy_test.sh production",
+    "sandbox": "./bin/deploy_test.sh"
   },
   "author": "Andy Savage <andy@savage.hk>",
   "license": "MIT"

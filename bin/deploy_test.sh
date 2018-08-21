@@ -11,6 +11,8 @@ TIMEOUT="60s"
 ENV_FILE="${DIR}/../.env.yaml"
 SOURCE="${DIR}/../"
 
+export PUBSUB_EMULATOR_HOST="localhost:8010"
+
 VARS=`cat "$ENV_FILE" | shyaml key-values`
 VARS=`echo "$VARS" | sed '$!N;s/\n/=/'`
 while read -r line; do

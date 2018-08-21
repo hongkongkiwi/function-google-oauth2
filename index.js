@@ -3,11 +3,7 @@
 const {OAuth2Client} = require('google-auth-library')
 const Storage = require('@google-cloud/storage')
 const fs = require('mz/fs')
-const {withFile} = require('tmp-promise')
-const has = require('lodash.has')
-const isNull = require('lodash.isnull')
-const isUndefined = require('lodash.isundefined')
-const isArray = require('lodash.isarray')
+const {has,isNull,isUndefined,isArray} = require('lodash')
 const {Buffer} = require('safe-buffer')
 const querystring = require('querystring')
 const url = require('url')
@@ -19,7 +15,8 @@ const tempFileMask = 'XXXXXXXXXX.json'
 
 /** Used when running on simulator **/
 const yamlFile = path.join(__dirname, '.env.yaml')
-if (process.env.PUBSUB_EMULATOR_HOST && fs.existsSync(yamlFile)) {
+
+if (fs.existsSync(yamlFile)) {
   const yaml = require('js-yaml')
   try {
     const config = yaml.safeLoad(fs.readFileSync(yamlFile, 'utf8'))
@@ -40,7 +37,6 @@ const scopes = process.env.OAUTH2_AUTH_SCOPES ? process.env.OAUTH2_AUTH_SCOPES.s
 const accessType = process.env.OAUTH2_AUTH_ACCESS_TYPE
 const projectId = process.env.GCP_PROJECT
 const bucketName = process.env.OAUTH2_STORAGE_BUCKET
-const storageTokenFile = process.env.OAUTH2_STORAGE_TOKEN_FILE
 const credsOauthClient = process.env.CREDENTIALS_OAUTH_CLIENT ? path.join(__dirname, process.env.CREDENTIALS_OAUTH_CLIENT.split('/').join(path.sep)) : null
 const credsStorageService = process.env.CREDENTIALS_STORAGE_SERVICE ? path.join(__dirname, process.env.CREDENTIALS_STORAGE_SERVICE.split('/').join(path.sep)) : null
 const encryptionKey = process.env.OAUTH2_ENCRYPTION_KEY ? Buffer.from(process.env.OAUTH2_ENCRYPTION_KEY, 'base64') : null
@@ -49,7 +45,6 @@ const redirectUrl = process.env.HTTP_TRIGGER_ENDPOINT + redirectCallbackPath
 if (isNull(scopes) ||
     isNull(accessType) ||
     isNull(bucketName) ||
-    isNull(storageTokenFile) ||
     isNull(credsOauthClient) ||
     isNull(credsStorageService)) {
       throw new Error("Environment Variables not available!")
@@ -61,6 +56,17 @@ let keys
 let storageCreds
 let oAuth2Client
 
+const verifyAndExtractToken = async (id_token) => {
+  const ticket = await oAuth2Client.verifyIdToken({
+      idToken: id_token,
+      audience: keys.installed.client_id,  // Specify the CLIENT_ID of the app that accesses the backend
+  })
+  return ticket.getPayload()
+  // console.log(payload)
+  // const userid = payload.sub
+  // const domain = payload.hd
+}
+
 const debugLog = (msg) => {
   console.log(msg)
 }
@@ -69,46 +75,46 @@ const createTempFile = async () => {
   return await tmp.tmpName()
 }
 
-const getTokenFile = async (srcFile, encKey) => {
-  const tempFile = await createTempFile()
-  const file = bucket.file(storageTokenFile)
-  const checkFileExists = _=>{
-    return file.exists().then((data)=>{ return data[0] })
-  }
-  if (!await checkFileExists()) {
-    console.log('Token does not exist!')
-    return null
-  }
-  let options = {
-    destination: tempFile
-  }
-  if (encryptionKey) options.encryptionKey = encryptionKey
-  console.log('File Exists trying to download')
-  await file.download(options)
-  debugLog(`File ${storageTokenFile} downloaded to ${tempFile}.`);
-  return tempFile
-}
+// const getTokenFile = async (srcFile, encKey) => {
+//   const tempFile = await createTempFile()
+//   const file = bucket.file(storageTokenFile)
+//   const checkFileExists = _=>{
+//     return file.exists().then((data)=>{ return data[0] })
+//   }
+//   if (!await checkFileExists()) {
+//     console.log('Token does not exist!')
+//     return null
+//   }
+//   let options = {
+//     destination: tempFile
+//   }
+//   if (encryptionKey) options.encryptionKey = encryptionKey
+//   console.log('File Exists trying to download')
+//   await file.download(options)
+//   debugLog(`File ${storageTokenFile} downloaded to ${tempFile}.`);
+//   return tempFile
+// }
 
-const getToken = async () => {
-  const tempTokenFile = await getTokenFile(storageTokenFile, encryptionKey)
-  console.log('tempTokenFile', tempTokenFile)
-  if (isNull(tempTokenFile)) {
-    debugLog("No Token file available from Cloud Storage")
-    return null
-  }
-  debugLog("Got Token File from Cloud Storage")
-  const tokenFileContents = await fs.readFile(tempTokenFile)
-  await fs.unlink(tempTokenFile)
-  return tokenFileContents
-}
+// const getToken = async () => {
+//   const tempTokenFile = await getTokenFile(storageTokenFile, encryptionKey)
+//   console.log('tempTokenFile', tempTokenFile)
+//   if (isNull(tempTokenFile)) {
+//     debugLog("No Token file available from Cloud Storage")
+//     return null
+//   }
+//   debugLog("Got Token File from Cloud Storage")
+//   const tokenFileContents = await fs.readFile(tempTokenFile)
+//   await fs.unlink(tempTokenFile)
+//   return tokenFileContents
+// }
 
-const storeToken = async (srcFilename) => {
+const storeToken = async (srcFilename, dstFilename) => {
   let options = {
-    destination: storageTokenFile
+    destination: dstFilename
   }
   if (encryptionKey) options.encryptionKey = encryptionKey
   await bucket.upload(srcFilename, options)
-  debugLog(`File ${srcFilename} uploaded to gs://${bucketName}/${storageTokenFile}.`)
+  debugLog(`File ${srcFilename} uploaded to gs://${bucketName}/${dstFilename}.`)
 }
 
 const getKeys = async () => {
@@ -138,8 +144,6 @@ const handleGet = async (req, res) => {
                             keyFilename: credsStorageService
                         }).bucket(bucketName)
     debugLog("Initialized bucket")
-    token = token || await getToken()
-    debugLog("Initialized token" + token)
     keys = keys || await getKeys()
     debugLog("Initialized keys" + keys)
     oAuth2Client = oAuth2Client || new OAuth2Client(
@@ -167,9 +171,13 @@ const handleGet = async (req, res) => {
       debugLog(`Got Authorization Code: ${code}`)
       try {
         token = await oAuth2Client.getToken(code)
+        token = token.tokens
         const tempFile = await createTempFile()
+        const details = await verifyAndExtractToken(token.id_token)
+        console.log('Got Token', details)
         await fs.writeFile(tempFile, token)
-        await storeToken(tempFile)
+        const storageTokenFile = 'tokens/' + details.email + '.json'
+        await storeToken(tempFile, storageTokenFile)
         await fs.unlink(tempFile)
         debugLog('Successfully stored token to cloud storage', res)
       } catch(err) {
