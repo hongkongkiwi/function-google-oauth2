@@ -1,23 +1,20 @@
 'use strict'
 
 const {OAuth2Client} = require('google-auth-library')
-const Storage = require('@google-cloud/storage')
 const fs = require('mz/fs')
 const {has,isNull,isUndefined,isArray} = require('lodash')
-const {Buffer} = require('safe-buffer')
-const querystring = require('querystring')
-const url = require('url')
 const path = require('path')
-const os = require('os')
-const tmp = require('tmp-promise')
-
-const tempFileMask = 'XXXXXXXXXX.json'
+let url
+let querystring
+let tmp
+let Storage
+let yaml
 
 /** Used when running on simulator **/
 const yamlFile = path.join(__dirname, '.env.yaml')
 
 if (fs.existsSync(yamlFile)) {
-  const yaml = require('js-yaml')
+  yaml = yaml || require('js-yaml')
   try {
     const config = yaml.safeLoad(fs.readFileSync(yamlFile, 'utf8'))
     for (let varName in config) {
@@ -27,7 +24,7 @@ if (fs.existsSync(yamlFile)) {
     console.error(e)
     process.exit(1)
   }
-  process.env.HTTP_TRIGGER_ENDPOINT = 'http://localhost:8010/squashed-melon/asia-northeast1/oauth2-manager'
+  process.env.HTTP_TRIGGER_ENDPOINT = 'http://localhost:8010/squashed-melon/asia-northeast1/' + process.env.FUNCTION_NAME
 }
 
 // Variables
@@ -39,7 +36,6 @@ const projectId = process.env.GCP_PROJECT
 const bucketName = process.env.OAUTH2_STORAGE_BUCKET
 const credsOauthClient = process.env.CREDENTIALS_OAUTH_CLIENT ? path.join(__dirname, process.env.CREDENTIALS_OAUTH_CLIENT.split('/').join(path.sep)) : null
 const credsStorageService = process.env.CREDENTIALS_STORAGE_SERVICE ? path.join(__dirname, process.env.CREDENTIALS_STORAGE_SERVICE.split('/').join(path.sep)) : null
-const encryptionKey = process.env.OAUTH2_ENCRYPTION_KEY ? Buffer.from(process.env.OAUTH2_ENCRYPTION_KEY, 'base64') : null
 const redirectUrl = process.env.HTTP_TRIGGER_ENDPOINT + redirectCallbackPath
 
 if (isNull(scopes) ||
@@ -56,9 +52,9 @@ let keys
 let storageCreds
 let oAuth2Client
 
-const verifyAndExtractToken = async (id_token) => {
+const verifyAndExtractToken = async (token) => {
   const ticket = await oAuth2Client.verifyIdToken({
-      idToken: id_token,
+      idToken: token.id_token,
       audience: keys.installed.client_id,  // Specify the CLIENT_ID of the app that accesses the backend
   })
   return ticket.getPayload()
@@ -72,6 +68,7 @@ const debugLog = (msg) => {
 }
 
 const createTempFile = async () => {
+  tmp = tmp || require('tmp-promise')
   return await tmp.tmpName()
 }
 
@@ -108,11 +105,11 @@ const createTempFile = async () => {
 //   return tokenFileContents
 // }
 
-const storeToken = async (srcFilename, dstFilename) => {
+const storeToken = async (srcFilename, dstFilename, encKey) => {
   let options = {
     destination: dstFilename
   }
-  if (encryptionKey) options.encryptionKey = encryptionKey
+  if (encKey) options.encryptionKey = encKey
   await bucket.upload(srcFilename, options)
   debugLog(`File ${srcFilename} uploaded to gs://${bucketName}/${dstFilename}.`)
 }
@@ -132,6 +129,8 @@ const getKeys = async () => {
 }
 
 const handleGet = async (req, res) => {
+  url = url || require('url')
+  querystring = querystring || require('querystring')
   const urlPath = url.parse(req.url).path.split('?')[0]
   const urlQS = querystring.parse(url.parse(req.url).query)
 
@@ -139,6 +138,7 @@ const handleGet = async (req, res) => {
     console.log(urlPath)
     return handleError('Invalid path passed', res)
   } else {
+    Storage = Storage || require('@google-cloud/storage')
     bucket = bucket || new Storage({
                             projectId: projectId,
                             keyFilename: credsStorageService
@@ -171,11 +171,15 @@ const handleGet = async (req, res) => {
       debugLog(`Got Authorization Code: ${code}`)
       try {
         token = await oAuth2Client.getToken(code)
+        console.log('Got Token', token)
         token = token.tokens
         const tempFile = await createTempFile()
-        const details = await verifyAndExtractToken(token.id_token)
-        console.log('Got Token', details)
-        await fs.writeFile(tempFile, token)
+        const details = await verifyAndExtractToken(token)
+        if (!has(details, 'email')) {
+          return handleError('Email is not available from token! Wrong scope?')
+        }
+        console.log('Got Token Details', details)
+        await fs.writeFile(tempFile, JSON.stringify(token,null,0), {encoding: 'utf8', flag: 'w'})
         const storageTokenFile = 'tokens/' + details.email + '.json'
         await storeToken(tempFile, storageTokenFile)
         await fs.unlink(tempFile)
